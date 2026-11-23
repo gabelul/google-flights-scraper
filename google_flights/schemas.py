@@ -136,6 +136,7 @@ class FlightFiltersSchema(FiltersSchema):
     max_layover_minutes = PositiveInt(max_value=2880)
     connecting_airports = AirportCodesField()
     less_emissions = Flag(load_default=False)
+    exclude_basic = Flag(load_default=False)
     carry_on_bags = _count(maximum=1)
     checked_bags = _count(maximum=2)
     sort_by = ChoiceField(SORTS, load_default="best")

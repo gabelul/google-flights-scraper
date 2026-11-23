@@ -194,6 +194,7 @@ def unpack_token(value, kind):
 #   5 max stops, 13 from {1 kind (1 airport, 3 city) 2 id}, 14 to}
 #   8: passenger (repeated; 1 adult 2 child 3 infant in seat 4 infant on lap)
 #   9: cabin   14: 1   19: trip (1 round trip, 2 one way, 3 multi-city)
+#   25: 1 = Economy (exclude Basic) fare tier (server-side filter)
 
 def _varint(n):
     out = b""
@@ -227,7 +228,8 @@ def _pb_place(num, p):
     return _pb_msg(num, _pb_int(1, 1 if p["kind"] == 0 else 3) + _pb_str(2, p["id"]))
 
 
-def tfs(trip, legs, *, cabin=1, adults=1, children=0, infants_in_seat=0, infants_on_lap=0):
+def tfs(trip, legs, *, cabin=1, adults=1, children=0, infants_in_seat=0, infants_on_lap=0,
+        exclude_basic=False):
     """legs: [{'origins': [place], 'destinations': [place], 'date': str,
     'max_stops': int|None, 'selected': [[from, date, to, None, airline, number]]}]"""
     body = _pb_int(1, 28) + _pb_int(2, 2)
@@ -246,5 +248,8 @@ def tfs(trip, legs, *, cabin=1, adults=1, children=0, infants_in_seat=0, infants
     for code, count in ((1, adults), (2, children), (3, infants_in_seat), (4, infants_on_lap)):
         for _ in range(count or 0):
             body += _pb_int(8, code)
-    body += _pb_int(9, cabin) + _pb_int(14, 1) + _pb_int(19, trip)
+    body += _pb_int(9, cabin)
+    if exclude_basic:
+        body += _pb_int(25, 1)
+    body += _pb_int(14, 1) + _pb_int(19, trip)
     return base64.urlsafe_b64encode(body).decode().rstrip("=")

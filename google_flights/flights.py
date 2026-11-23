@@ -172,7 +172,8 @@ def _page_payload(trip, leg_specs, kw, locale):
     tfs = protocol.tfs(
         trip, leg_specs, cabin=CABIN_CODES[kw.get("cabin_class") or "economy"],
         adults=kw.get("adults") or 1, children=kw.get("children") or 0,
-        infants_in_seat=kw.get("infants_in_seat") or 0, infants_on_lap=kw.get("infants_on_lap") or 0)
+        infants_in_seat=kw.get("infants_in_seat") or 0, infants_on_lap=kw.get("infants_on_lap") or 0,
+        exclude_basic=bool(kw.get("exclude_basic")))
     _, html = fetch.page("/travel/flights/search", locale, {"tfs": tfs})
     payload = fetch.af_blobs(html).get("ds:1")
     if not isinstance(payload, list):
@@ -185,6 +186,15 @@ def _tfs_leg(origins, destinations, day, kw, selected=None):
             "max_stops": _TFS_STOPS[protocol.STOPS[kw.get("stops") or "any"]], "selected": selected}
 
 
+def _page_only_guard(kw):
+    """exclude_basic rides the token-free search page (tfs field 25); the
+    shopping RPC has no mapped slot for it, so reject combinations only the
+    RPC can express instead of silently ignoring the fare filter."""
+    if kw.get("exclude_basic") and (kw.get("carry_on_bags") or kw.get("checked_bags")
+                                    or any(a in protocol.ALLIANCES for a in kw.get("airlines") or [])):
+        raise ValueError("exclude_basic cannot combine with alliance filters or checked/carry-on bags")
+
+
 # ---- endpoints -----------------------------------------------------------------------------------
 
 def search_one_way(origin, destination, departure_date, currency=None, language=None, country=None, **kw):
@@ -194,12 +204,15 @@ def search_one_way(origin, destination, departure_date, currency=None, language=
     origins, destinations = places.resolve(origin, locale), places.resolve(destination, locale)
     req = _request(protocol.TRIP_ONE_WAY, [protocol.leg(origins, destinations, departure_date, **_leg_options(kw))], kw)
     sort = kw.get("sort_by") or "best"
+    _page_only_guard(kw)
 
     def tokenize(it, raw, selection):
         it["booking_token"] = (protocol.pack_token("booking", g=raw, q=req, s=[selection], l=_pack_locale(locale))
                                if raw else None)
 
     try:
+        if kw.get("exclude_basic"):
+            raise MinterUnavailable  # field-25 fare filter exists only on the search page
         out = _results(_shop(req, sort, locale), locale, tokenize)
     except MinterUnavailable:
         local = _fallback_filters(kw)
@@ -221,11 +234,14 @@ def search_round_trip(origin, destination, departure_date, return_date, currency
             protocol.leg(destinations, origins, return_date, **_leg_options(kw, "return_"))]
     req = _request(protocol.TRIP_ROUND, legs, kw)
     sort = kw.get("sort_by") or "best"
+    _page_only_guard(kw)
 
     def tokenize(it, raw, selection):
         it["returning_token"] = protocol.pack_token("returning", q=req, s=[selection], l=_pack_locale(locale), o=sort)
 
     try:
+        if kw.get("exclude_basic"):
+            raise MinterUnavailable  # field-25 fare filter exists only on the search page
         out = _results(_shop(req, sort, locale), locale, tokenize)
     except MinterUnavailable:
         local = _fallback_filters(kw)
@@ -257,20 +273,25 @@ def search_multi_city(legs, currency=None, language=None, country=None, **kw):
     priced for the whole trip; continue with next_leg_token."""
     locale = _locale(currency, language, country)
     kw.update(currency=locale["currency"])
-    built, resolved = [], []
+    built, resolved, leg_specs = [], [], []
     for spec in legs:
         origins, destinations = places.resolve(spec["origin"], locale), places.resolve(spec["destination"], locale)
         resolved.append({"origin": [o["id"] for o in origins], "destination": [d["id"] for d in destinations],
                          "date": spec["date"]})
         built.append(protocol.leg(origins, destinations, spec["date"], **_leg_options(kw)))
+        leg_specs.append(_tfs_leg(origins, destinations, spec["date"], kw))
     req = _request(protocol.TRIP_MULTI_CITY, built, kw)
     sort = kw.get("sort_by") or "best"
     total = len(built)
+    _page_only_guard(kw)
 
     def tokenize(it, raw, selection):
         it["next_leg_token"] = protocol.pack_token("next_leg", q=req, s=[selection], l=_pack_locale(locale), o=sort)
 
-    out = _results(_shop(req, sort, locale), locale, tokenize)
+    if kw.get("exclude_basic"):
+        out = _results(_page_payload(protocol.TRIP_MULTI_CITY, leg_specs, kw, locale), locale, tokenize)
+    else:
+        out = _results(_shop(req, sort, locale), locale, tokenize)
     return {"search": {"trip_type": "multi_city", "legs": resolved, "current_leg": 1, "total_legs": total,
                        "cabin_class": kw.get("cabin_class") or "economy", "currency": locale["currency"]}, **out}
 

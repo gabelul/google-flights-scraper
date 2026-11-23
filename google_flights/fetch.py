@@ -93,7 +93,14 @@ _local = threading.local()
 
 
 def _new_session(proxy):
-    return sessions.curl_session(IMPERSONATE, proxy)
+    from google_flights.minter import CONSENT_SOCS  # lazy, mirrors the MINTER import
+    sess = sessions.curl_session(IMPERSONATE, proxy)
+    # EU exits land on consent.google.com before any Flights page; seed the
+    # same consent cookies the box browser uses so the token-free page path
+    # (and exclude_basic, which rides it) works from datacenter IPs.
+    sess.cookies.set("SOCS", CONSENT_SOCS, domain=".google.com", path="/")
+    sess.cookies.set("CONSENT", "PENDING+987", domain=".google.com", path="/")
+    return sess
 
 
 def _session(fresh_exit=False):
