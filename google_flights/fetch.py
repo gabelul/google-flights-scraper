@@ -198,9 +198,16 @@ def _raise_for_errors(errors, what):
                 raise GoogleFlightsBadRequest(f"{what}: Google rejected the parameters (HTTP {status})")
             raise GoogleFlightsUpstreamError(f"{what}: Google error HTTP {status} code {code}")
         code, detailed = err
-        if code == 13 and not detailed:
+        # Code 13 is the BotGuard/verification error. It used to arrive bare
+        # (detailed=False); it now often carries Google's typed
+        # travel.frontend.flights.ErrorResponse wrapper (detailed=True).
+        # Either way it means the token did not verify, not that the request
+        # body is wrong: a mint from one sick parked page fails while the next
+        # mint passes, so treat every 13 as TokenRejected and re-mint instead
+        # of killing the search as a bad-request (2026-11-23 evening outage).
+        if code == 13:
             raise TokenRejected(f"{what}: BotGuard token rejected")
-        if code in (3, 13):
+        if code == 3:
             raise GoogleFlightsBadRequest(f"{what}: Google rejected the parameters "
                                           "(dates too far apart or in the past, unknown place, or an unsupported combination)")
         if code == 5:
