@@ -169,11 +169,16 @@ class TokenMinter:
         (flights.py falls back to the server-rendered search page)."""
         import browser_client
         import config
-        # No proxy (the token is not IP-bound), so every candidate would key
-        # the one "direct" browser: name INPAGE_BROWSER_SLOTS x
-        # BROWSER_BURST_FACTOR sessions instead and let the box pick an idle
-        # parked page or open another while it has headroom (2026-11-04).
-        candidates = [(None, f"flights#{i}") for i in range(config.burst_slots(config.INPAGE_BROWSER_SLOTS))]
+        # Mint through the same exit the RPC is posted from. The token is
+        # not IP-bound on paper, but 2026-11-23 evening testing showed Google
+        # rejecting mints whose box exit differed from the poster exit with
+        # RPC code 13 intermittently - a minted-here/posted-there mismatch
+        # the old "no proxy" comment no longer covers. When
+        # GOOGLE_FLIGHTS_PROXY is set, the box rides it too so the whole
+        # pipeline shares one identity; without the env this stays None and
+        # box + poster both use the machine's own IP as before.
+        candidates = [(config.google_flights_minter_proxy(), f"flights#{i}")
+                      for i in range(config.burst_slots(config.INPAGE_BROWSER_SLOTS))]
         try:
             # a cold mint = up to 20 s queue + a 120 s warm on the box, past
             # the client's 60 s default (section F, 2026-11-04)
