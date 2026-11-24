@@ -74,6 +74,13 @@ _BIND_FN = """function(method) {
 
 _MINT_JS = "async (freq) => window.__gfMint ? await window.__gfMint(freq) : null"
 
+# NOTE (2026-11-24): under Google's evening suppression the raw run() output
+# was observed as a 9-element JSON array string ("["token",null,null,223,32,
+# null,null,0,"5"]"), not the bare token string the morning verified. The
+# binding below keeps posting the raw output until the real page's own bgr
+# header can be captured post-suppression and the exact extraction aligned -
+# do not guess the element mapping while every token is rejected anyway.
+
 # "General consent" SOCS value: says yes to cookie use, no to ad
 # personalization, for .google.com. Enough for the app to load and mint.
 CONSENT_SOCS = "CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmRlIAEaBgiA_LyaBg"
