@@ -21,7 +21,6 @@ from concurrent.futures import ThreadPoolExecutor
 import config
 from google_flights import fetch, parsers, places, protocol
 from google_flights.fetch import GoogleFlightsBadRequest, GoogleFlightsNotFound, GoogleFlightsUpstreamError
-from google_flights.minter import MinterUnavailable
 from google_flights.shared import CABIN_CODES
 
 SORT_KEYS = {
@@ -80,12 +79,57 @@ def _shop(req, sort, locale):
     return chunks[0]
 
 
-def _results(payload, locale, tokenize, filters=None, sort=None):
+BASIC_CHECK_CAP = 15
+
+
+def _drop_basic_only(best, other, req, currency, cap=BASIC_CHECK_CAP):
+    """exclude_basic applied client-side: booking options are fetched for the
+    cheapest itineraries and ones selling ONLY basic economy fares are
+    removed (an itinerary that also offers a regular fare stays, since the
+    booker can pick it). Google has no server-side input for this any more:
+    the typed GetShoppingResults API has no fare-filter slot (2026-11-25
+    slot sweep on the exact UI-shaped request) and the SPA drops tfs field
+    25 when decoding a search URL (request-capture diff, same day), so the
+    OpenFare-style page flag is dead too. Checking is capped at the `cap`
+    cheapest rows - basic economy only ever lives in the cheapest band -
+    and a booking error keeps the row (fail-open per itinerary)."""
+    ranked = sorted(best + other,
+                    key=lambda it: (it.get("price") is None, it.get("price") or 0))
+    verdict = {}
+    checked = 0
+    for it in ranked:
+        if checked < cap and it.get("_raw_token") and it.get("_selection") is not None:
+            checked += 1
+            try:
+                chunks = fetch.rpc("GetBookingResults",
+                                   protocol.booking_body(it["_raw_token"],
+                                                         protocol.with_selection(req, [it["_selection"]])))
+                options, *_ = parsers.parse_booking(chunks, currency)
+                regular = [o for o in options
+                           if not o.get("is_basic_economy") and o.get("price") is not None]
+                if options and not regular:
+                    verdict[id(it)] = False          # sells only basic economy: drop
+                else:
+                    verdict[id(it)] = True
+                    if regular:
+                        # the shown price must not be the basic fare either
+                        it["price"] = min(o["price"] for o in regular)
+            except Exception:
+                verdict[id(it)] = True
+        else:
+            verdict[id(it)] = True
+    return ([it for it in best if verdict.get(id(it), True)],
+            [it for it in other if verdict.get(id(it), True)], checked)
+
+
+def _results(payload, locale, tokenize, filters=None, sort=None, req=None, exclude_basic=False):
     currency = locale["currency"]
     best, other, extras = parsers.parse_shopping(payload, currency)
     if filters:
         best = [it for it in best if _passes(it, filters)]
         other = [it for it in other if _passes(it, filters)]
+    if exclude_basic and req is not None:
+        best, other, _checked = _drop_basic_only(best, other, req, currency)
     if sort and sort != "best" and filters is not None:
         other = sorted(best + other, key=SORT_KEYS[sort])
         best = []
@@ -186,15 +230,6 @@ def _tfs_leg(origins, destinations, day, kw, selected=None):
             "max_stops": _TFS_STOPS[protocol.STOPS[kw.get("stops") or "any"]], "selected": selected}
 
 
-def _page_only_guard(kw):
-    """exclude_basic rides the token-free search page (tfs field 25); the
-    shopping RPC has no mapped slot for it, so reject combinations only the
-    RPC can express instead of silently ignoring the fare filter."""
-    if kw.get("exclude_basic") and (kw.get("carry_on_bags") or kw.get("checked_bags")
-                                    or any(a in protocol.ALLIANCES for a in kw.get("airlines") or [])):
-        raise ValueError("exclude_basic cannot combine with alliance filters or checked/carry-on bags")
-
-
 # ---- endpoints -----------------------------------------------------------------------------------
 
 def search_one_way(origin, destination, departure_date, currency=None, language=None, country=None, **kw):
@@ -204,22 +239,13 @@ def search_one_way(origin, destination, departure_date, currency=None, language=
     origins, destinations = places.resolve(origin, locale), places.resolve(destination, locale)
     req = _request(protocol.TRIP_ONE_WAY, [protocol.leg(origins, destinations, departure_date, **_leg_options(kw))], kw)
     sort = kw.get("sort_by") or "best"
-    _page_only_guard(kw)
 
     def tokenize(it, raw, selection):
         it["booking_token"] = (protocol.pack_token("booking", g=raw, q=req, s=[selection], l=_pack_locale(locale))
                                if raw else None)
 
-    try:
-        if kw.get("exclude_basic"):
-            raise MinterUnavailable  # field-25 fare filter exists only on the search page
-        out = _results(_shop(req, sort, locale), locale, tokenize)
-    except MinterUnavailable:
-        local = _fallback_filters(kw)
-        if local is None:
-            raise
-        payload = _page_payload(protocol.TRIP_ONE_WAY, [_tfs_leg(origins, destinations, departure_date, kw)], kw, locale)
-        out = _results(payload, locale, tokenize, filters=local, sort=sort)
+    out = _results(_shop(req, sort, locale), locale, tokenize, req=req,
+                   exclude_basic=bool(kw.get("exclude_basic")))
     return {"search": _search_meta("one_way", origins, destinations, kw), **out}
 
 
@@ -234,22 +260,12 @@ def search_round_trip(origin, destination, departure_date, return_date, currency
             protocol.leg(destinations, origins, return_date, **_leg_options(kw, "return_"))]
     req = _request(protocol.TRIP_ROUND, legs, kw)
     sort = kw.get("sort_by") or "best"
-    _page_only_guard(kw)
 
     def tokenize(it, raw, selection):
         it["returning_token"] = protocol.pack_token("returning", q=req, s=[selection], l=_pack_locale(locale), o=sort)
 
-    try:
-        if kw.get("exclude_basic"):
-            raise MinterUnavailable  # field-25 fare filter exists only on the search page
-        out = _results(_shop(req, sort, locale), locale, tokenize)
-    except MinterUnavailable:
-        local = _fallback_filters(kw)
-        if local is None:
-            raise
-        payload = _page_payload(protocol.TRIP_ROUND, [_tfs_leg(origins, destinations, departure_date, kw),
-                                                      _tfs_leg(destinations, origins, return_date, kw)], kw, locale)
-        out = _results(payload, locale, tokenize, filters=local, sort=sort)
+    out = _results(_shop(req, sort, locale), locale, tokenize, req=req,
+                   exclude_basic=bool(kw.get("exclude_basic")))
     return {"search": _search_meta("round_trip", origins, destinations, kw, return_date=return_date), **out}
 
 
@@ -283,15 +299,12 @@ def search_multi_city(legs, currency=None, language=None, country=None, **kw):
     req = _request(protocol.TRIP_MULTI_CITY, built, kw)
     sort = kw.get("sort_by") or "best"
     total = len(built)
-    _page_only_guard(kw)
 
     def tokenize(it, raw, selection):
         it["next_leg_token"] = protocol.pack_token("next_leg", q=req, s=[selection], l=_pack_locale(locale), o=sort)
 
-    if kw.get("exclude_basic"):
-        out = _results(_page_payload(protocol.TRIP_MULTI_CITY, leg_specs, kw, locale), locale, tokenize)
-    else:
-        out = _results(_shop(req, sort, locale), locale, tokenize)
+    out = _results(_shop(req, sort, locale), locale, tokenize, req=req,
+                   exclude_basic=bool(kw.get("exclude_basic")))
     return {"search": {"trip_type": "multi_city", "legs": resolved, "current_leg": 1, "total_legs": total,
                        "cabin_class": kw.get("cabin_class") or "economy", "currency": locale["currency"]}, **out}
 
