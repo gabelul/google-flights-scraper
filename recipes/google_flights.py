@@ -10,6 +10,10 @@ class GoogleFlights(TokenMint):
     name = "google-flights"
     headless = False
     geoip_timezone = False
+    # BotGuard (2026-11-24) hangs its on-page mint in driver-launched
+    # browsers; the box must be a plain human-launched Chrome (see
+    # patchright_driver.PatchrightDriver.human_launch).
+    human_launch = True
     variants = {"": "https://www.google.com/travel/flights?hl=en&gl=us&curr=USD"}
     park = False
     idle_seconds = 300

@@ -38,6 +38,7 @@ import queue
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -789,13 +790,125 @@ def _navigator_languages(locale, accept=None):
     return languages_for(locale, accept)
 
 
+def _free_port():
+    """A free localhost TCP port for the human-launch CDP endpoint."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class _AuthForwarder:
+    """A local CONNECT forwarder that adds Proxy-Authorization upstream.
+
+    Chrome's --proxy-server cannot carry credentials, and a driver-side
+    auth handler is exactly what human_launch avoids. One daemon thread
+    per accept; traffic is pure byte relay after the CONNECT handshake
+    (all of Google is HTTPS)."""
+    # Buffer sizes relayed at a time; a scraper box's flows are small.
+    BUFSZ = 65536
+
+    def __init__(self, server: str, username: str, password: str):
+        import base64, socketserver
+        from urllib.parse import urlparse
+        u = urlparse(server if "//" in server else "http://" + server)
+        self._up_host, self._up_port = u.hostname, u.port or 80
+        token = base64.b64encode(f"{username}:{password}".encode()).decode()
+        self._auth_header = f"Basic {token}"
+        outer = self
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                try:
+                    req = outer._read_head(self.request)
+                    if not req:
+                        return
+                    line = req.split(b"\r\n", 1)[0]
+                    if line.startswith(b"CONNECT"):
+                        target = line.split()[1].decode()
+                        up = socket.create_connection((outer._up_host, outer._up_port), timeout=30)
+                        up.sendall(
+                            f"CONNECT {target} HTTP/1.1\r\n"
+                            f"Host: {target}\r\n"
+                            f"Proxy-Authorization: {outer._auth_header}\r\n"
+                            "Proxy-Connection: keep-alive\r\n\r\n".encode())
+                        resp = outer._read_head(up)
+                        if not resp or b" 200" not in resp.split(b"\r\n", 1)[0]:
+                            self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            up.close()
+                            return
+                        self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        outer._relay(self.request, up)
+                    else:
+                        # plain http absolute-URI request: forward with auth
+                        head, _, body = req.partition(b"\r\n\r\n")
+                        head = head.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                        lines = head.split(b"\r\n")
+                        lines = [l for l in lines if not l.lower().startswith(b"proxy-authorization:")]
+                        lines.insert(1, f"Proxy-Authorization: {outer._auth_header}".encode())
+                        up = socket.create_connection((outer._up_host, outer._up_port), timeout=30)
+                        up.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + body)
+                        outer._relay(up, self.request)
+                except Exception:
+                    pass
+
+        self._srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.port = self._srv.server_address[1]
+        self._thread = threading.Thread(target=self._srv.serve_forever,
+                                        daemon=True, name="auth-forwarder")
+
+    def _read_head(self, sock, limit=65536):
+        """Read until the end of the HTTP head (double CRLF)."""
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < limit:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def _relay(self, a, b):
+        import select
+        socks = [a, b]
+        try:
+            while True:
+                r, _, x = select.select(socks, [], socks, 60)
+                if x or not r:
+                    break
+                for s in r:
+                    out = b if s is a else a
+                    chunk = s.recv(self.BUFSZ)
+                    if not chunk:
+                        return
+                    out.sendall(chunk)
+        except Exception:
+            pass
+
+    def start(self):
+        self._thread.start()
+        return f"http://127.0.0.1:{self.port}"
+
+
 class PatchrightDriver:
     def __init__(self, proxy_url, headless=False, block_resources=None,
                  reset_on_release=False, browserforge=False, timezone=None,
                  channel=None, executable=None, direct_hosts=None,
                  geoip_timezone=None, block_hosts=None, extra_args=None,
-                 locale=None):
+                 locale=None, human_launch=False):
         self._headless = bool(headless)
+# human_launch: spawn a plain, human-style Chrome (OS subprocess, no
+        # patchright bootstrap) and ATTACH over CDP. Google's BotGuard
+        # (2026-11-24) silently hangs its on-page token mint when the browser
+        # was launched by a driver (patchright/playwright bootstrap): the SPA
+        # then never fires GetShoppingResults and tokens minted on such pages
+        # fail verification (code 13). The same mint succeeds in a Chrome the
+        # OS launched - even with CDP attached afterwards and used for
+        # evaluation (proven A/B on a human Mac session, same profile flow).
+        # Proxy auth goes through a local CONNECT forwarder because Chrome's
+        # --proxy-server cannot carry credentials.
+        self._human_launch = bool(human_launch)
         # extra_args: extra Chrome switches for this driver (browser_worker
         # recipes: e.g. "--disable-http2" for Google hosts through a proxy,
         # whose h2 tunnel never answers on the Contabo box, 2026-10-22).
@@ -920,6 +1033,59 @@ class PatchrightDriver:
         with _drivers_lock:
             _drivers.add(self)
 
+    # ---- human launch ----------------------------------------------------
+    def _launch_human(self, pw, proxy, launch_args, launch_env):
+        """Spawn Chrome like a human would (plain CLI, no driver bootstrap)
+        and attach over CDP. See human_launch in __init__ for why."""
+        exe = (self._executable or os.environ.get("CHROME_BIN")
+               or "/usr/bin/google-chrome")
+        if not os.path.exists(exe):
+            raise RuntimeError(f"human_launch: browser binary not found: {exe}")
+        port = _free_port()
+        fwd = None
+        server = None
+        if proxy:
+            server = proxy.get("server") or ""
+            if proxy.get("username") and proxy.get("password"):
+                fwd = _AuthForwarder(server, proxy["username"], proxy["password"])
+                fwd.start()
+                server = fwd.start()
+        args = [exe,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={self._profile_dir}",
+                # container realities Chrome cannot skip (patchright's launcher
+                # adds these too): no setuid sandbox in Docker, no GPU, and a
+                # small /dev/shm.
+                "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                "--no-first-run", "--no-default-browser-check",
+                "--disable-session-crashed-bubble"]
+        if self._headless:
+            args.append("--headless=new")
+        if server:
+            args.append(f"--proxy-server={server}")
+            args.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+        args.extend(launch_args or [])
+        args.extend(self._extra_args)
+        env = dict(os.environ)
+        if launch_env:
+            env.update({k: v for k, v in launch_env.items() if k == "TZ"})
+        errlog = open(os.path.join(self._profile_dir, "chrome-stderr.log"), "wb")
+        proc = subprocess.Popen(args, env=env,
+                                stdout=subprocess.DEVNULL, stderr=errlog)
+        self._procs = [psutil.Process(proc.pid)]
+        deadline = time.monotonic() + 30
+        endpoint = f"http://127.0.0.1:{port}"
+        import urllib.request as _ur
+        while time.monotonic() < deadline:
+            try:
+                with _ur.urlopen(endpoint + "/json/version", timeout=2) as r:
+                    if r.status == 200:
+                        return pw.chromium.connect_over_cdp(endpoint)
+            except Exception:
+                pass
+            time.sleep(0.4)
+        raise RuntimeError("human_launch: CDP endpoint never came up")
+
     # ---- owner thread ---------------------------------------------------
     def _main(self, proxy):
         pw = None
@@ -1010,18 +1176,23 @@ class PatchrightDriver:
                 # disable_non_proxied_udp keeps WebRTC inside the proxy.
                 launch_args.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
             launch_args.extend(self._extra_args)
-            browser = pw.chromium.launch_persistent_context(
-                user_data_dir=self._profile_dir,
-                headless=self._headless,
-                proxy=proxy,
-                **({"args": launch_args} if launch_args else {}),
-                **({"env": launch_env} if launch_env else {}),
-                **emulate,
-                **({"channel": channel,
-                    "no_viewport":True,
-                    } if channel else {}),
-                **({"executable_path": exe} if exe else {}),
-            )
+            if self._human_launch:
+                browser = self._launch_human(pw, proxy, launch_args, launch_env)
+                ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            else:
+                browser = pw.chromium.launch_persistent_context(
+                    user_data_dir=self._profile_dir,
+                    headless=self._headless,
+                    proxy=proxy,
+                    **({"args": launch_args} if launch_args else {}),
+                    **({"env": launch_env} if launch_env else {}),
+                    **emulate,
+                    **({"channel": channel,
+                        "no_viewport":True,
+                        } if channel else {}),
+                    **({"executable_path": exe} if exe else {}),
+                )
+                ctx = browser
             # browserforge=True: overlay a fresh, statistically-real
             # browserforge fingerprint (navigator/screen/WebGL/fonts) per
             # driver via an init script — opted into PER SCRAPER (g2 pool,
@@ -1067,8 +1238,11 @@ class PatchrightDriver:
                 # with the backed-up requests showing up as multi-GB renderer
                 # memory. (fallback() vs continue_() never mattered: an
                 # unhandled fallback is continued from Python as well.)
-                browser.route(self._block_url_re, lambda route: route.abort())
-            page = browser.new_page()
+                ctx.route(self._block_url_re, lambda route: route.abort())
+            if self._human_launch and ctx.pages:
+                page = ctx.pages[0]        # the browser-created start tab
+            else:
+                page = ctx.new_page()
             page.set_default_timeout(30000)
         except Exception as e:
             self._start_error = e

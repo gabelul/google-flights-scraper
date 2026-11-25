@@ -164,7 +164,8 @@ class Recipe:
             direct_hosts=self.direct_hosts, browserforge=self.browserforge,
             timezone=self.timezone, extra_args=self.chrome_args,
             geoip_timezone=bool(proxy) and self.geoip_timezone,
-            locale=self.locale, channel=self.channel)
+            locale=self.locale, channel=self.channel,
+            human_launch=bool(getattr(self, "human_launch", False)))
 
     def _launch_camoufox(self, proxy: Optional[str], headless: bool):
         """A CamoufoxDriver (Firefox) for the recipe: geoip (timezone /
